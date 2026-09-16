@@ -1,480 +1,797 @@
 # Ouroboros 设计文档
 
-**重点：方向控制。** 版本图、能力账本、盲区出题都是为它服务的底座。README 是入口，这里是细节。
+**版本定位：模型方言自适应的 Agent 进化控制平面。**
 
----
+本文定义母体 Agent、底层模型、方言 Genome、评测器和 Ouroboros 控制器之间的边界。README 是项目入口，本文是实现蓝图和实验协议。
 
-## 1. 两个正交的轴
+## 1. 问题定义与边界
 
-讨论自进化时最容易混淆的两件事：
+### 1.1 要解决的问题
 
-- **层次** = 改**哪里**
-- **指标（方向）** = 往**哪个指标**使劲
+同一个 Agent Runtime 换用不同模型后，工具调用、上下文保持、错误恢复和完成判断可能出现系统性差异。传统做法通常是为每个模型人工维护一套 prompt 或工具适配，缺少统一的实验、版本和恢复机制。
 
-它们垂直。同一个层次可以往不同方向调；同一个方向可以用不同层次实现。
+Ouroboros 要验证的假设是：
 
-```
-                准确率    token    延迟
-  指令层           x         x
-  上下文层         x         x
-  工具层           x
-  编排层           x                   x
-  代码层           x                   x
-  权重层           x                   x
-```
+> 可以通过固定行为探针建立模型指纹，并通过受控的方言和代码变异，逐步找到更适合该模型的 Agent Genome，从而在保持能力的前提下降低调用损耗。
 
-**层次 x 指标 = 真正的搜索空间。**
+### 1.2 不做什么
 
-## 2. 进化层次：6 + 1
+v1 不包含：
 
-| # | 改什么 | 代表工作 |
-| --- | --- | --- |
-| 1 | **指令层** — 提示词、系统提示 | APE / OPRO / ProTeGi / TextGrad / GEPA |
-| 2 | **上下文层** — playbook、记忆内容 | ACE |
-| 3 | **工具层** — 工具箱本身（增删改工具） | Voyager 技能库 |
-| 4 | **编排层** — workflow、子 agent 拓扑、规划策略 | ADAS、GPTSwarm |
-| 5 | **代码层** — Agent 自己的源码 | DGM、SICA |
-| 6 | **权重层** — 模型参数 | SEAL、STaR、RLVR |
-| **+1** | **评测层** — 任务与判定标准本身 | Aspire、R-Zero、Absolute Zero |
+- 模型权重微调；
+- 真实世界不可回滚的副作用；
+- 让候选读取或修改 held-out 评测集；
+- 让模型自评结果直接决定版本接受；
+- 运行时即时修改线上 Agent；
+- 一开始支持所有 Agent 框架和所有进化层次。
 
-前 6 个改的是"Agent 怎么做"，第 7 个改的是"**什么叫做好**"。
+首版只覆盖 harness / context / tool protocol / runtime code，并选择代码或工具调用这类可机械验证的领域。
 
-**本项目的定位在 1~5 层**（harness / 上下文层），因为权重层需要 GPU 微调，本机不具备条件。
+## 2. 角色和术语
 
-## 3. 进化信号从哪来
-
-与"改哪里"正交的另一个维度，按强弱排：
-
-| 级别 | 信号来源 | 可靠性 |
-| --- | --- | --- |
-| 1 | 人类标注的测试集 | 最高，最常用 |
-| 2 | 环境可执行反馈（编译 / 测试 / 游戏分数） | 最高，最干净 |
-| 3 | 模型自我反思（Reflexion / GEPA） | 可用，会自欺 |
-| 4 | 模型自出题自判 | 最容易崩 |
-| 5 | 只给模糊目标 | 最接近真正闭合 |
-
-**结论：只用 1 和 2 做主信号，3 只能辅助，4 和 5 需要额外隔离设计才敢碰。**
-
-## 4. 指标分三层
-
-| 层 | 数量 | 参不参与权衡 | 处理方式 |
-| --- | --- | --- | --- |
-| **方向（主旋钮）** | 不限（受测量成本限制） | 参与 | 用户拨动的轴 |
-| **债务登记** | 不限 | 不参与 | 允许借（暂时丢能力），但必须记账，可随时还 |
-| **观测项** | 不限 | 不参与 | 只记录，用于事后分析和告警 |
-
-**与最初设计的差别：** 原先把第二层设计成"底线 / 硬门禁"（不许丢能力）。因为能力可以从历史版本捞回来（第 11 节），丢失不再致命，所以改成**债务登记**——借债可以，赖账不行。
-
-## 5. 为什么方向维度不再受"最多 3 个"限制
-
-最初的约束是"主旋钮最多 3 个"，理由是**帕累托前沿在高维会退化**：维度越高，互相"全面碾压"的概率越低，10 个版本在 5 维下可能 9 个都留在前沿上，筛选等于失效。
-
-**但方向控制框架下不做支配筛选** —— 用户选一个方向，系统沿那个方向搜索，其他方向允许退化。既然不靠支配关系筛选，这个理由就不成立了。
-
-只剩下两个真实约束：
-
-1. **测量成本** —— 每个维度都要花钱测。这是硬约束
-2. **用户理解** —— 用户得知道自己拨的是什么。这是软约束
-
-## 6. 完整指标清单
-
-### 质量类
-
-| 指标 | 建议归属 | 说明 |
-| --- | --- | --- |
-| 任务通过率 / 准确率 | **方向** | 最常被选的主方向 |
-| 输出正确性 | 并入准确率 | 有 ground truth 时 |
-| 多次运行方差 | 观测项 | 衡量稳定性 |
-| 泛化性 | 不是指标 | 是**验证方式**（用 held-out 测准确率） |
-
-### 成本类
-
-| 指标 | 建议归属 | 说明 |
-| --- | --- | --- |
-| Token 消耗 | **方向** | 第二热门，用户最常想拨的 |
-| 金钱成本 | 观测项 | 与 token 高度相关，通常选一个 |
-| 延迟 / 墙钟时间 | 观测项 / 方向 | 测量贵，按需测；用户明确在意速度时升为方向 |
-| 调用轮数 / 步数 | 观测项 | 与延迟高度相关 |
-
-### 过程质量类
-
-| 指标 | 建议归属 |
-| --- | --- |
-| 工具调用错误率 | 观测项 |
-| 卡死 / 无效循环率 | 观测项 |
-| 上下文压缩损失 | 观测项 |
-| 上下文窗口占用峰值 | 观测项 |
-
-### 债务登记类（不进方向）
-
-| 指标 | 说明 |
-| --- | --- |
-| 历史能力保留状态 | 每项能力标 pass / fail，以及可逆性 |
-| 越界行为：改测试 / 写系统目录 / 外联 | 必须为 0（这类不记账，直接拒绝） |
-
-### 产品类
-
-| 指标 | 建议归属 |
-| --- | --- |
-| 用户干预次数 | 观测项 |
-| 澄清提问次数 | 观测项 |
-
-## 7. 判断某个指标该进哪一层
-
-问三个问题：
-
-1. 它**便宜、能每次都测**吗？
-2. 用户**真的会为它做取舍**吗？ → 会，就进"方向"
-3. 它和已有的方向**独立**吗？（不高度相关）
-
-第 1 条不过 → 降级为观测项。第 2 条不过 → 观测项。第 3 条不过 → 和已有方向合并。
-
-### 7.1 容易混淆的"假指标"
-
-| 看起来像新指标 | 实际是 |
-| --- | --- |
-| 泛化性 | 验证方式（用 held-out 测准确率） |
-| 鲁棒性 | 同一指标多次运行的方差 |
-| 金钱成本 vs token | 高度相关，选一个 |
-| 步数 vs 延迟 | 高度相关 |
-
-**真实的独立轴其实很少。** 很多人一上来列七八个指标，实际只有两个是独立的。
-
-## 8. 方向控制：核心机制
-
-### 8.1 交互循环
-
-```
-用户拨动方向 -> 系统沿该方向搜索 -> 报告代价 -> 用户确认
-     ^                                             |
-     +----------------- 随时切换 -------------------+
+```text
+Mother Agent Runtime  被进化的 Agent 外壳
+Target Model           被适配的底层模型
+Dialect Genome         控制 Agent 与模型交互的可版本化配置和代码
+Ouroboros              外部候选搜索、账本和版本晋级控制器
+Evaluator              使用外部事实判定任务结果的组件
+Capability             一组可重复测试定义的行为能力
 ```
 
-### 8.2 帕累托前沿从"筛选器"降级为"选项菜单"
+第一母体基地为 **Pydantic AI Harness/Coder**。它提供可组合的工具、指令、上下文和 coding agent 能力，适合作为可观测、可替换的运行骨架。[Pydantic AI 官方文档](https://pydantic.dev/docs/ai/overview/)
 
-因为不做支配筛选，帕累托不再用来决定"留哪些版本"。它只剩一个用途：
+首个目标模型为 **DeepSeek-V4.1-Flash**，官方 API 模型名为 `deepseek-flash`。DeepSeek 文档列出工具调用、JSON 输出、Responses API 和 thinking mode 支持。[DeepSeek 模型与定价](https://api-docs.deepseek.com/quick_start/pricing/)
 
-> 回答"从当前位置出发，往各个方向拨最近能到哪几个点"。
+Open Interpreter 和 OpenHands 不作为母体。它们在后续阶段通过 Adapter 进入，用来验证适配方法能否覆盖更完整的 coding agent。
 
-高维下前沿很大不是失败，是**菜单更丰富**。真正要做的是：
+### 2.1 Runtime 是可替换的实验条件
 
-- **沿用户选的方向排序** → 给出朝这个方向最好的几个版本
-- **代价标注** → 每个版本标上"目标方向涨了多少、其他方向付了多少、哪些代价不可逆"
+Ouroboros 不把某一个 Agent loop 当成永久母体。`Mother Agent Runtime` 通过稳定的 Runtime Contract 暴露以下边界：
 
-### 8.3 版本保留策略
+```text
+render(messages, genome) -> provider request
+parse(response) -> tool calls / final answer
+execute(tool_call) -> tool result
+reduce_context(trace, genome) -> next context
+should_finish(trace, genome) -> bool
+```
 
-不能什么都不筛，否则几百代下来会有几千个版本。策略：
+因此，替换 Pydantic AI Harness/Coder、参考 Runtime、Open Interpreter、OpenHands 或自研 Runtime 时，可能同时改变消息顺序、工具循环、错误恢复、上下文压缩和完成判断。换 Runtime 不是只换一个 Provider，而是换了一组实验条件。
 
-> **每个方向的当前最佳版本 + 若干里程碑版本（可回滚点）**
-
-比维护帕累托简单得多，够用。
-
-### 8.4 执行前的不可逆警告
-
-因为允许用户自由拨动，控制器必须在执行前能说：
-
-> "往'省 token'方向走，预计有 2 项能力可能是**不可逆**损失（多文件重构、并发 bug 定位），接受吗？"
-
-可逆的代价随便付；不可逆的要用户明确点头。**这把"自由"变成"有知情权的自由"。**
-
-## 9. 可逆代价 / 不可逆代价 / 能力债
-
-这是整个设计的枢纽。用具体例子说明。
-
-假设用户要**省 token**，准确率从 82% 掉到 78%。这 4% 有两种成因：
-
-**成因 A —— 权衡（可逆）**
-Agent 回答变简短了，准确率略降。但它**仍然会做那件事**，只是做得糙。
-→ 拨回来就恢复。**回得去。**
-
-**成因 B —— 遗忘（不可逆）**
-这 4% 是靠"改上下文压缩策略"省的，压缩时把关键细节丢了，Agent **不再会做"多文件重构"了**。
-→ 拨回来它**还是不会**。**回不去** —— 除非从历史版本把那个改动捞回来。
-
-**这两种在总分上看起来一模一样。** 没有任何现有系统能分开它们。
-
-而它们直接决定"可以切换回来"这个承诺能不能兑现：
-
-- 全是成因 A → 随便拨
-- 混进成因 B → **承诺落空**，回程终点不是 82%，而是 70%
-
-### 9.1 能力债
-
-既然不可逆损失可以从历史版本捞回（第 11 节），丢失就不再致命。所以模型是：
-
-> **为了往某个方向进化，允许暂时借债丢能力 —— 但必须记账，而且随时可以还。**
-
-**借债可以，赖账不行。** 账本的作用就是防赖账。
-
-### 9.2 三样东西版本管理救不了
-
-| 项 | 为什么救不了 |
-| --- | --- |
-| **权重** | 一旦微调，切基因组不会恢复模型参数。本机不做权重层，天然规避 |
-| **外部世界副作用** | Agent 在真实环境执行过动作（提交 PR、改数据库），**世界不会回滚** |
-| **已花掉的时间与钱** | 分支救不回预算 |
-
-第 2 条是物理意义上的不可逆。**这也是"域必须选在沙箱内可验证"的又一个理由。**
-
-## 10. 版本图 + 能力账本
-
-### 10.1 基因组天然可版本管理
-
-基因组如果是纯文本 / 文件（prompt、工具定义、配置、代码），任何一代都能完整保存、随时切回。**所以在基因组层面没有不可逆。**
-
-这不是新发明：**DGM 的 archive 存的就是每代的 docker 镜像，本质就是分支。**
-
-### 10.2 但"切回分支"有隐藏的巨大代价
-
-先看数字。假设：
-
-- 版本 47：准确率 82%，会 20 项能力
-- 版本 100：准确率 78%，会 33 项能力 ← 中间多了 15 项、丢了 2 项
-
-| 选择 | 结果 |
-| --- | --- |
-| 切回分支 47 | 拿回 2 项，**丢掉 15 项** → 净亏 13 项 |
-| 留在 100 | 保住 15 项，丢着那 2 项 |
-| **留在 100 + 把 2 项从 47 移植过来** | **35 项** |
-
-**问题在于你不能"只撤销那个错误"** —— 分支是整条时间线，切回去就是整条时间线一起退。
-
-### 10.3 正确操作是 cherry-pick，不是 checkout
-
-- **回滚** = 把整辆车倒回上一个路口
-- **能力移植** = 留在原地，从旧车上拆个零件装到新车上
-
-要做到能力移植，账本必须能回答：
-
-> 第 17 项能力是在哪个版本存在的？是**哪个改动**引入的？
-
-这就是 `edit` 和 `attribution` 两个字段的必要性 —— 只有 `capabilities` 一个字段只够知道"丢了"，不够知道"从哪捞回来"。
-
-### 10.4 数据结构（草案）
+每个运行实例必须声明：
 
 ```yaml
-version: 100
-parent: 43
-branch: token-saving
-timestamp: 2026-09-15T21:00:00+08:00
+runtime_id: pydantic-ai-harness
+runtime_version: 0.1.0
+runtime_commit: sha256:...
+runtime_contract_version: 1
+```
 
-direction:                          # 这一代的进化方向（核心）
-  primary: tokens
-  secondary: [latency]
-  acceptable_cost:                  # 允许支付的代价上限
-    accuracy: 0.05
+旧 Genome 只能在 Runtime Contract 兼容且通过迁移探针后复用。否则创建新的 Runtime 分支，保留旧版本作为 baseline、迁移来源和回滚点。
 
-metrics:                            # 各方向上的读数
-  accuracy: 0.78
-  tokens: 18000
-  latency_ms: 14000
+兼容性不能只由版本号判断：即使 Contract 主版本不变，只要请求/响应行为变化，也必须生成新的 Profile 并至少重跑 smoke probes。
 
-observations:                       # 观测项，不参与决策
-  steps: 12
-  tool_errors: 1
-  context_peak: 0.71
+| 变更 | 指纹处理 | Genome 处理 |
+| --- | --- | --- |
+| 仅日志字段或观测代码变化 | 可保留原 fingerprint，但更新 environment hash | 可复用，重新跑 canary |
+| Provider、消息渲染、工具 schema、重试或上下文逻辑变化 | 新建 fingerprint 条件 | 旧 patch 进入 migration candidates |
+| Agent loop、工具执行语义或完成判断变化 | 新建 Runtime Profile 和 fingerprint | 旧 Genome quarantine，必须重新 baseline |
+| Evaluator、Sandbox 或任务协议变化 | 新建 eval/environment manifest | 禁止跨 manifest 直接比较接受结果 |
 
-capabilities:                       # 能力表
-  - id: cap-017
-    name: 多文件重构
-    status: pass
-    since: 12
-  - id: cap-018
-    name: 并发 bug 定位
-    status: fail
-    lost_at: 100
-    reversibility: irreversible     # reversible | irreversible
-    recover_from: 47                # 从哪个版本可以捞回来
+## 3. 系统总架构
 
-edit:                               # 意图，用于因果归因
-  layer: context
-  summary: 压缩策略改为先摘要后丢弃
-  diff_ref: patches/100.diff
+```mermaid
+flowchart TD
+    P[Model Probes] --> F[Model Fingerprint]
+    F --> G[Dialect Genome]
+    G --> R[Mother Agent Runtime]
+    R --> RP[Runtime Profile]
+    RP --> F
+    R --> M[Target Model]
+    R --> T[Tools in Sandbox]
+    T --> X[Execution Trace]
+    M --> X
+    X --> E[External Evaluator]
+    E --> A[Failure Analysis]
+    A --> C[Mutation Controller]
+    C --> G
+    E --> L[Capability Ledger]
+    C --> L
+    L --> V[Version Graph]
+```
 
-delta:                              # 父代 -> 子代 差分
-  gained: [cap-031, cap-032]
-  lost: [cap-018]
+### 3.1 组件边界
 
-cost:                               # 代价分类（核心）
-  reversible:
-    - metric: accuracy
-      delta: -0.01
-      reason: 回答变简短
-  irreversible:
-    - capability: cap-018
-      recoverable_from: 47
+| 组件 | 输入 | 输出 | 关键约束 |
+| --- | --- | --- | --- |
+| **Provider Adapter** | model、messages、tools、settings | 原始响应、usage、错误 | 保留 provider 特有字段，不隐藏方言差异 |
+| **Model Probes** | 模型和候选方言 | 探针轨迹 | 任务和判定预注册 |
+| **Mother Runtime** | Genome、任务、预算 | trace、结果、工具调用 | 不决定候选是否晋级 |
+| **Sandbox Runner** | 候选 Genome、工具 | 隔离执行结果 | 禁网、限时、限资源、评测只读 |
+| **Evaluator** | trace、外部答案或测试 | per-task 判定和置信区间 | 不使用模型自评作为主信号 |
+| **Mutation Controller** | 指纹、失败分类、方向约束 | 原子候选 patch | 每代默认只改一个主要组件 |
+| **Ledger** | 版本、运行、评测、能力 | 可查询的事件和谱系 | 记录不可变 artifact 引用 |
+| **Transfer Engine** | 源版本能力、目标版本 | patch、冲突和恢复报告 | 移植后必须联合回归 |
 
-debt:                               # 能力债
-  open:
-    - capability: cap-018
-      since: 100
-      repay_from: 47
+## 4. Model Fingerprint：模型指纹
+
+### 4.1 指纹的定义
+
+指纹不是“这个模型的固定分数”，而是条件化行为描述：
+
+```text
+Fingerprint = F(model, provider, version, dialect, decode, tools, tasks, environment)
+```
+
+以下条件变化时，应视为新的指纹条件：
+
+- Agent Runtime 的实现、版本、commit 或 Runtime Contract 变化；
+- provider 或 API 格式变化；
+- 精确模型版本变化；
+- system prompt 或工具 schema 变化；
+- thinking / reasoning 设置变化；
+- tokenizer 或上下文压缩策略变化；
+- 工具集合或沙箱版本变化。
+
+### 4.2 探针任务
+
+探针不是开放式聊天，而是固定、可重复、能区分行为的任务：
+
+```text
+工具调用：工具名、JSON 合法性、必填字段、参数类型
+多轮状态：是否正确使用上一轮工具结果
+错误恢复：错误后是否修复、重试或重新规划
+上下文：长结果、摘要和状态字段是否被保留
+终止：是否过早结束、无限继续或误判完成
+成本：输入 token、输出 token、reasoning token、延迟
+```
+
+一个探针如果在当前模型上始终 0% 或 100% 通过，信息量不足，应降级为观测项或替换。
+
+### 4.3 最小数据结构
+
+```yaml
+model_id: deepseek-flash
+provider: deepseek
+model_version: DeepSeek-V4.1-Flash
+runtime_id: pydantic-ai-harness
+runtime_version: 0.1.0
+runtime_contract_version: 1
+api_format: openai_compatible
+decode:
+  thinking: enabled
+  reasoning_effort: high
+  temperature: null
+tool_environment_hash: sha256:...
+probe_manifest_hash: sha256:...
+metrics:
+  tool_call_success_rate: 0.0
+  schema_following_rate: 0.0
+  argument_error_rate: 0.0
+  retry_recovery_rate: 0.0
+  context_retention: 0.0
+  finish_detection: 0.0
+  average_input_tokens: 0
+  average_output_tokens: 0
+  average_reasoning_tokens: 0
+  p50_latency_ms: 0
+  p95_latency_ms: 0
+```
+
+## 5. Dialect Genome：可进化对象
+
+### 5.1 组件
+
+```text
+PromptPolicy
+MessageRenderer
+ToolRegistry
+ToolSchema
+ToolCallParser
+ToolResultFormatter
+RetryPolicy
+ContextCondenser
+FinishDetector
+Planner
+Executor
+AgentRuntimeCode
+```
+
+每个组件都有版本和内容哈希。首版变异必须是 typed、原子、可回放的 patch。
+
+Genome 的根标识不是只有 `model_id`，而是二元运行目标：
+
+```text
+GenomeTarget = (runtime_profile, model_fingerprint)
+```
+
+同一模型在两个 Runtime 上必须拥有不同分支，例如：
+
+```text
+deepseek-flash
+├── pydantic-ai-harness@0.1 / fingerprint@a1...
+└── openhands@0.9         / fingerprint@b7...
+```
+
+这样可以区分“模型方言变了”和“母体 Runtime 变了”，避免把 Runtime 差异错误归因给模型。
+
+### 5.2 变异类别
+
+```text
+Prompt：调整规则顺序、示例、约束和完成说明
+Tool：修改名称、字段名、必填字段、描述和参数排列
+Result：修改工具结果的摘要、错误和状态格式
+Control：修改 retry、重规划和终止条件
+Context：修改压缩触发条件和保留字段
+Code：修改一个 Runtime 函数或解析器
+```
+
+不允许候选在首版自由重写整个 Agent。每个 patch 必须带：
+
+```text
+intent
+changed_component
+diff_ref
+parent_version
+preconditions
+expected_failure_class
+```
+
+## 6. 模型适应原理和执行循环
+
+### 6.1 完整闭环
+
+```text
+1. 运行固定基线和探针
+2. 生成条件化 Model Fingerprint
+3. 从 trace 分类失败
+4. 把失败分类转成修改假设
+5. 生成 1～3 个原子候选
+6. 在 dev 集做同题同 seed 配对评测
+7. 通过安全和编译门后运行 held-out
+8. 计算目标收益、能力代价和净成本
+9. 通过约束后写入不可变版本节点
+10. 将新节点激活为该模型分支的候选父代
+```
+
+### 6.2 失败分类
+
+首版至少使用：
+
+```text
+tool_name_mismatch
+invalid_arguments
+schema_omission
+wrong_result_interpretation
+unnecessary_retry
+context_loss
+premature_termination
+late_termination
+planning_failure
+compile_or_test_failure
+timeout_or_resource_failure
+unknown
+```
+
+模型分类器可以辅助标注，但关键失败必须保留原始 trace，并对分类做人工抽样复核。分类本身不能读取 held-out 答案。
+
+### 6.3 同题配对评测
+
+对 parent 和 candidate 使用：
+
+- 同一任务；
+- 同一 seed；
+- 随机化运行顺序；
+- 相同预算和工具环境；
+- 至少三次重复。
+
+报告逐题差异、paired bootstrap 或置信区间，不只比较一次聚合分数。
+
+### 6.4 在线和离线边界
+
+线上运行只做：
+
+```text
+采集 trace
+记录失败
+累积候选适应样本
+```
+
+线上不做：
+
+```text
+自动改 prompt
+自动切换 Runtime 代码
+把线上样本直接加入 hidden 判定集
+```
+
+达到样本阈值后，在隔离分支进行下一轮适应。
+
+### 6.5 Runtime 变更后的重新校准协议
+
+Runtime 变更必须显式进入 `recalibration` 状态，不能继续把新旧轨迹混入同一个 fingerprint。协议如下：
+
+```text
+1. 冻结旧 Runtime 分支和线上 Genome
+2. 生成新 Runtime Profile（实现哈希、Contract、依赖、工具环境）
+3. 运行兼容性探针：消息、工具、错误、上下文、终止和成本
+4. 对新 Runtime 建立 parent baseline 和新的 Model Fingerprint
+5. 将旧 patch 按组件映射为 migration candidates
+6. 在 dev 上做同题同 seed 的旧 Runtime、新 Runtime 和迁移候选比较
+7. 在 held-out 上独立验收；失败的 patch 标记为 incompatible
+8. 通过硬约束后，创建新的 runtime/model Genome 分支并激活
+```
+
+Runtime 迁移至少要区分三种结果：
+
+```text
+portable       patch 在新 Runtime 上语义和指标均保持
+adapted        patch 需要重新表达，但意图和收益可复现
+incompatible   patch 依赖旧 Runtime 语义，禁止直接应用
+```
+
+迁移报告必须记录旧、新 Runtime 的逐题结果、工具协议差异、失败分类、patch 映射和证据哈希。没有新 Runtime 的独立 baseline，不能称为“模型适配成功”。
+
+### 6.6 自适应模块本身也要可进化
+
+Ouroboros 的 Mutation Controller、Failure Classifier、Probe Scheduler、Evaluator Adapter 和 Transfer Engine 也是版本化组件，但它们与目标 Agent Genome 分开记账：
+
+```text
+Controller Genome
+├── probe policy
+├── failure taxonomy / classifier
+├── mutation operators
+├── acceptance thresholds
+└── transfer mappings
+
+Target Agent Genome
+├── prompt / messages
+├── tools / schemas
+├── context / retry / finish
+└── runtime adapter code
+```
+
+控制平面升级也要先在固定历史轨迹上做 replay，再用冻结的外部评测器验收。控制器不能通过修改评测器、放宽门槛或改变任务采样来制造收益。若 Runtime 发生替换，先升级或选择对应的 Transfer Mapping，再重新校准目标 Genome；不能假设旧控制器理解新 Runtime 的失败信号。
+
+控制器版本至少绑定：
+
+```yaml
+controller_version: ouroboros-control-0.2.0
+probe_scheduler_version: ...
+mutation_operator_manifest: sha256:...
+acceptance_policy_hash: sha256:...
+transfer_map_version: ...
+```
+
+## 7. 方向控制器
+
+### 7.1 目标表达
+
+首版使用主方向加约束，不使用复杂 RL：
+
+```yaml
+primary: total_tokens
+secondary_observations:
+  - task_success_rate
+  - tool_error_rate
+  - retry_count
+constraints:
+  heldout_success_lower_bound: baseline - 0.03
+  tool_error_rate_max: baseline + 0.01
+  security_violations: 0
+  evaluator_tampering: 0
+budget:
+  max_candidate_calls: 3
+  max_generation_cost: 10.0
+```
+
+“省 token”不能靠截断答案实现。必须同时报告成功率、完整输入输出 token、reasoning token、重试和人工失败成本。
+
+### 7.2 接受规则
+
+候选只有同时满足以下条件才能晋级：
+
+1. 安全、越权、评测污染和数据泄露为 0；
+2. 编译、基础回归和工具协议检查通过；
+3. held-out 指标满足预注册下限；
+4. 目标方向达到最小实用效应；
+5. 账本已经写入逐任务结果和 artifact 引用；
+6. 预算和净成本没有违反当前方向的约束。
+
+### 7.3 净成本
+
+适应不能只比较部署时的 token。周期成本包括：
+
+```text
+probe + fingerprint + failure classification
++ candidate generation + dev + held-out
++ retries + sandbox CPU/storage + human review
+```
+
+只有在预设部署量下：
+
+```text
+累计部署节省 > 一次性适应成本
+```
+
+才称为“净收益”。否则只能报告离线指标改善。
+
+## 8. 版本图与能力账本
+
+### 8.1 版本节点
+
+```yaml
+version_id: v-0012
+parent_id: v-0011
+model_id: deepseek-flash
+branch: deepseek-flash-genome
+timestamp: 2026-09-16T12:00:00+08:00
+layer: tool_protocol
+direction:
+  primary: total_tokens
+  constraints:
+    accuracy_drop_max: 0.03
+edit:
+  intent: reduce_invalid_arguments
+  changed_component: ToolSchema
+  diff_ref: artifacts/patches/sha256:...
+  preconditions: [tool_registry_v3]
+metrics:
+  task_success_rate: 0.82
+  input_tokens: 1200
+  output_tokens: 800
+  reasoning_tokens: 2100
+  total_tokens: 4100
+  tool_error_rate: 0.06
+  retry_count: 0.4
+capability_delta:
+  gained: [cap-003]
+  lost: []
+attribution:
+  evidence: paired_dev_and_heldout
+  confidence: 0.82
+reversibility:
+  status: unknown
+  evidence_ref: null
+debt:
+  opened: []
   repaid: []
+environment_hash: sha256:...
+eval_manifest_hash: sha256:...
 ```
 
-### 10.5 关键字段的作用
+### 8.2 能力状态
 
-| 字段 | 作用 |
-| --- | --- |
-| `direction` | 记录用户拨的是哪个方向，用于事后归因"这个方向的收益如何" |
-| `capabilities` | 把 per-task 结果归到具名能力上。**整个设计最难的一步** |
-| `edit` | 记录**意图**。没有它无法做因果归属。DGM 缺的就是这个 |
-| `attribution` / `cost` | 把"哪次改动"和"丢了哪项能力"绑定，并标注可逆性 |
-| `debt` | 未偿还的能力债。这是"允许自由拨动"的安全网 |
+能力由任务集合定义，而不是由模型自我描述：
 
-### 10.6 与现有工作的区别
+```yaml
+id: cap-003
+name: multi_file_refactor
+tests: [task-014, task-027, task-041]
+status: pass
+confidence: 0.91
+since_version: v-0007
+lost_at: null
+recover_from: null
+```
 
-| 已有做法 | 它有什么 | 缺什么 |
+状态允许：
+
+```text
+pass / fail / uncertain
+```
+
+“不可逆”不是单次观察结果，而是经过恢复实验后得到的经验状态。
+
+### 8.3 版本保留
+
+保留：
+
+- 每个模型分支当前最佳版本；
+- 里程碑版本；
+- 当前版本的祖先链；
+- 仍被能力债引用的来源版本；
+- 仍可能用于 transfer 的 artifact。
+
+只有无引用、非里程碑、非祖先且没有能力来源依赖的节点才能进入 GC。
+
+## 9. 能力归因、可逆性与移植
+
+### 9.1 归因原则
+
+不能从“父子分数差”直接推出因果。首版按以下优先级提供证据：
+
+```text
+单变异 patch + paired evaluation
+    > 多变异消融
+    > 失败轨迹与改动意图一致
+    > 聚合分数变化
+```
+
+没有足够证据时，`attribution.confidence` 必须较低，`reversibility.status` 保持 `unknown`。
+
+### 9.2 可逆性状态
+
+```text
+unknown
+likely_reversible
+likely_irreversible
+confirmed_reversible
+confirmed_irreversible
+```
+
+一次能力失败只能打开 `potential_debt`：
+
+```text
+能力 X 在版本 B 失败
+历史版本 A 曾通过
+记录可能债务
+```
+
+只有独立回归和恢复实验重复失败，才可以确认不可逆。
+
+### 9.3 定向恢复实验
+
+```text
+A：能力 X 通过
+B：能力 X 失败，但获得 Y、Z
+B + patch(X)：应用来自 A 的候选 patch
+```
+
+验收必须同时确认：
+
+- X 恢复；
+- Y、Z 没有超出阈值的退化；
+- 编译、工具和安全回归通过；
+- 多 seed 结果稳定。
+
+恢复失败时保留冲突、依赖和回归证据，不把 cherry-pick 成功等同于能力恢复。
+
+## 10. Agent 代码级自修改
+
+Agent 可以修改自己的 Runtime 代码，但修改发生在 Ouroboros 管理的候选分支和沙箱中：
+
+```text
+进化编辑器生成 patch
+    ↓
+静态扫描和依赖检查
+    ↓
+编译、lint、单元回归
+    ↓
+沙箱任务评测
+    ↓
+held-out 验收
+    ↓
+不可变 artifact + 版本节点
+```
+
+禁止候选：
+
+- 修改评测判定代码；
+- 读取 hidden 任务；
+- 写系统目录；
+- 开启未授权网络；
+- 删除失败日志；
+- 修改账本历史。
+
+## 11. DeepSeek Provider 适配
+
+### 11.1 固定配置
+
+```yaml
+provider: deepseek
+model: deepseek-flash
+model_version: DeepSeek-V4.1-Flash
+base_url: https://api.deepseek.com
+api_format: openai_compatible
+```
+
+DeepSeek 文档显示 `deepseek-flash` 支持工具调用、JSON 输出、Responses API、Anthropic API 和 thinking mode。[官方模型文档](https://api-docs.deepseek.com/quick_start/pricing/)
+
+### 11.2 reasoning_content 约束
+
+在 thinking mode 且携带工具调用时，后续请求必须保留完整 `reasoning_content`。Provider Adapter 不能只保存普通 `content`，否则多轮工具执行可能失败。[官方 Thinking Mode 文档](https://api-docs.deepseek.com/guides/thinking_mode/)
+
+因此每次运行至少记录：
+
+```text
+content
+reasoning_content
+tool_calls
+tool_results
+usage.prompt_tokens
+usage.completion_tokens
+usage.reasoning_tokens（若 provider 提供）
+```
+
+thinking mode、reasoning effort 和 API 格式必须成为指纹条件，不同配置不能混入同一组实验。
+
+## 12. 实验设计
+
+### 12.1 首个实验固定项
+
+```text
+母体：Pydantic AI Harness/Coder
+模型：DeepSeek-V4.1-Flash
+模型标识：deepseek-flash
+领域：代码或工具调用
+工具：2～4 个确定性工具
+能力标签：5～10 个
+每题重复：至少 3 个 seed
+方向：任务成功率 + total tokens
+```
+
+### 12.2 对照组
+
+```text
+Control A：固定方言，不适配
+Control B：普通 prompt 优化器
+Treatment：Model Fingerprint + Dialect Genome + Ledger
+```
+
+实验应做 `model × adaptation` 因子比较，并在后续将 DeepSeek 适配 patch 交叉测试到 GPT、Claude 和未见模型版本。
+
+如果某个 patch 只对 DeepSeek 有效，应称为“模型条件化方言”，不能宣称通用自进化。
+
+### 12.3 关键指标
+
+```text
+任务成功率
+逐题能力通过率
+tool call 成功率
+参数错误率
+无效重试率
+输入 token
+输出 token
+reasoning token
+总 token
+p50 / p95 延迟
+沙箱 CPU 和存储
+适应周期总成本
+每个成功任务的总成本
+```
+
+token 下降但失败、重试或墙钟时间上升时，不能直接判为收益。
+
+## 13. 分阶段实现计划
+
+### P0：母体和基线
+
+出口条件：
+
+- 可运行标准库参考 Runtime，并为后续接入 Pydantic AI Harness/Coder 保留 Provider/Genome 边界；
+- Provider Adapter 能记录原始响应和 usage；
+- 固定任务、seed、预算可以重放；
+- Runtime Profile、Runtime Contract 和实现哈希会写入每次运行；
+- 本地 test provider 或 Ollama 可在无 API key 时跑通日志链路。
+
+当前实现已提供：
+
+```powershell
+python -m ouroboros.cli baseline --provider test --output-dir G:\\DevCache\\Temp\\ouroboros-baseline
+```
+
+命令会生成 `results.jsonl` 和 `run_manifest.json`，并通过统一的 Runtime/Evaluator 路径记录逐题结果。
+
+Pydantic AI 母体 Adapter 已加入，但依赖保持可选：
+
+```powershell
+python -m pip install -e ".[pydantic]"
+```
+
+`ouroboros.pydantic_adapter.PydanticAIAgentAdapter` 委托 Pydantic AI 的 `Agent.run_sync()`，并把 output、usage、消息历史、工具结果和异常转换为 Ouroboros `RunResult`。换用该 Runtime 后必须使用新的 `RuntimeProfile` 重新建立 fingerprint 和 baseline。
+
+### P1：探针和指纹
+
+出口条件：
+
+- 探针清单和判定预注册；
+- 生成条件化 `ModelFingerprint`；
+- 失败 taxonomy 可查询；
+- 关键分类有抽样复核。
+
+当前离线实现已提供六个确定性协议探针，覆盖工具调用、schema、结果解释、完成判断、重试恢复和上下文保持：
+
+```powershell
+python -m ouroboros.cli probe --output-dir G:\\DevCache\\Temp\\ouroboros-probe
+```
+
+命令会生成 `results.jsonl`、`fingerprint.json` 和 `run_manifest.json`。这些结果用于验证评测链路，不代表真实模型的能力结论。
+
+Provider 适配边界已经覆盖两种不同协议：OpenAI-compatible Chat（DeepSeek、GPT 网关）和 Anthropic Messages（Claude 网关）。两者必须分别记录 `api_format` 和 `RuntimeProfile`，不能仅通过替换 model 字符串混用消息渲染器。
+
+### P2：原子变异和 dev 选择
+
+出口条件：
+
+- 方言组件可独立变异；
+- parent/candidate 使用同题同 seed 配对；
+- 候选 patch 可回放；
+- 无适应、无画像、随机变异消融可运行。
+
+当前实现已提供受限 mutation、同题同 seed 的 paired acceptance、确定性 bootstrap 差异报告和 SQLite 版本/能力账本。可用离线 test provider 跑通一代候选：
+
+```powershell
+python -m ouroboros.cli evolve --output-dir G:\\DevCache\\Temp\\ouroboros-evolve
+```
+
+命令会写入 `baseline_results.jsonl`、候选结果、`decisions.json`、`ledger.db` 和 `run_manifest.json`。离线 provider 的候选行为是固定的，因此该命令只验证探针、变异、配对评测、硬约束和记账链路，不代表 DeepSeek 的适配收益。
+
+真实模型适配使用 `adapt` 命令。它从环境变量读取密钥，将同一个 `RuntimeProfile` 和同一个 probe manifest 绑定到 parent/candidate，候选最多修改一个 Genome 层，并用同题同 seed 的配对结果执行硬约束门禁：
+
+```powershell
+$env:ANTHROPIC_API_KEY="<key>"
+python -m ouroboros.cli adapt --provider anthropic --base-url https://www.right.codes `
+  --model claude-haiku-4-5-20251001 --probe-id probe-finish-marker `
+  --max-candidates 1 --seeds 0 --output-dir G:\DevCache\Temp\rightcodes-claude-adapt
+```
+
+适配结果会生成 `baseline_results.jsonl`、`mutation-*_results.jsonl`、`baseline_fingerprint.json`、`decisions.json`、`ledger.db` 和 `run_manifest.json`。当前 Claude 小样本已自动识别 `finish_format_mismatch` 并生成候选；候选没有提升成功率且增加 40 tokens，所以被门禁拒绝。这证明控制器能发现模型方言差异并尝试修复，也证明失败候选不会被误晋级。
+
+### P3：独立验收和激活
+
+出口条件：
+
+- held-out 物理隔离；
+- 预注册硬约束可执行；
+- 通过后才激活新 Genome；
+- 版本不可变且可回滚；
+- 固定 parent canary 能检测 provider 漂移；
+- Runtime 替换会自动进入 recalibration，旧 Genome 进入 quarantine，不能直接激活；
+- 迁移候选必须标记为 `portable`、`adapted` 或 `incompatible`。
+
+### P4：跨模型和净成本
+
+出口条件：
+
+- GPT/Claude Adapter 能复用同一实验协议；
+- Pydantic AI、Open Interpreter、OpenHands 或自研 Runtime 可以共享 Contract，但分别建立 Runtime Profile 和校准分支；
+- DeepSeek 专属 patch 与跨模型 patch 分开统计；
+- 适应一次性成本、部署成本和 break-even 可计算；
+- 只有达到最小实用效应才宣称净收益。
+
+## 14. 风险与降级策略
+
+| 风险 | 控制 | 降级 |
 | --- | --- | --- |
-| CI 回归门控（Tracely-ai / agent-qa） | 二值门禁：套件过没过 | 没有能力粒度、没有跨代因果 |
-| DGM 的 archive | 每版本的聚合分数 + 谱系 + docker 快照 | 只用一个标量决策；快照只用于选父代，不做能力移植 |
-| GEPA 的帕累托 | 在**实例**维度上的帕累托 | 不在**指标**维度上 |
-| 记忆系统（MemOS / Letta 等） | 存内容、可检索 | 不存能力状态与因果归因 |
+| 模型漂移 | 锁版本、记录 provider 和 parent canary | 重新建立指纹，暂停自动晋级 |
+| 奖励投机 | hidden 只读、禁网、静态扫描 | 退回人工审核和固定版本 |
+| 能力误归因 | 单变异、消融、置信度和 unknown | 只记 potential debt |
+| 评测过拟合 | 物理隔离、任务轮换、外部判定 | 只报告 dev 结果，不激活 |
+| token 投机 | 记录完整成本、成功率和重试 | 将 token 降级为观测项 |
+| 版本爆炸 | 保留策略和引用可达性 GC | 暂停生成新分支 |
+| API 成本过高 | 分层评测、缓存、预算上限 | 用 test provider 或本地 smoke test |
+| patch 迁移冲突 | 依赖检查和联合回归 | 标记不可移植，不强行应用 |
 
-## 11. 方向控制器
+## 15. 相关工作定位
 
-### 11.1 它做什么
+Ouroboros 不声称首次提出 Agent 自进化、版本归档或遗忘指标。它的可检验定位是：
 
-基于账本决定：**这一代替换哪一层、朝哪个方向、步子多大、可接受代价是多少。**
+> 把模型条件化方言、用户可选方向、能力级代价和定向恢复实验放进同一个 harness 层闭环。
 
-账本是状态，控制器是策略。
+现有工作可以分别覆盖代码自改进、上下文进化、回归门控、记忆或版本存档；本项目要验证的是它们之间是否能通过能力账本和模型专属 Genome 形成可操作的适配流程。
 
-### 11.2 为什么需要它
-
-DGM 里"该改什么"由每一代的 o1 从零推导，而且只在代码层改。没有任何持久机制记住"上次往这个方向走代价是多少"。
-
-有了控制器可以做到：
-
-- 第 10 代攻工具层，目标是省 token
-- 第 11 代攻指令层，目标是准确率
-- 第 12 代回头补盲区
-
-**这是现在的系统做不到的动作。**
-
-### 11.3 它必须回答的问题
-
-> "往这个方向走，会削弱什么？其中哪些不可逆？"
-
-只能从账本回答 —— 需要**历史上往这个方向走时的代价数据**。这是账本作为"代价度量表"的价值所在。
-
-## 12. 盲区出题器
-
-### 12.1 铁律：出题可自生，判定不能自生
-
-如果系统既出题又判分，收敛结果必然是"自己给自己打高分"，与真实能力脱钩。这是自进化的经典死法。
-
-| 用途 | 谁提供 |
-| --- | --- |
-| **练**（探索、发现盲区） | 可以自生成 |
-| **判**（决定收不收） | 必须外部锚定、固定、物理隔离、人类验证过 |
-
-### 12.2 自生成题目的价值是找盲区，不是打分
-
-固定测试集必然有覆盖空白 —— 有些能力根本没有题去测。生成器的作用是**专攻这些空白**。这两件事混起来就废了。
-
-### 12.3 用可机械验证的筛子控制质量
-
-- 一道题如果当前 Agent 100% 通过或 0% 通过 → 没有信息量，扔掉
-- 只有通过率在中间区间（例如 0.2~0.8）的题才有区分度
-
-这个筛子不可作弊，完全自动。**所以你不需要"判断题目好不好"，只需要"筛掉没有区分度的题"。**
-
-## 13. 执行顺序
-
-```
-版本图 + 账本（状态） -> 方向控制（策略） -> 盲区出题（生成器）
-                                |
-                    固定 held-out 判收不收
-```
-
-**顺序不能反：**
-
-- 没有版本图和账本，方向控制就是瞎指挥，"能切回来"是空话
-- 没有可靠的状态，出题器只会重复生产已有的题
-
-## 14. 验证方式
-
-### 14.1 必须做对照实验
-
-**同一个循环，带账本 vs 不带账本。** 这是唯一能证明它有用的方法。
-
-这也是为什么本项目做**可插拔组件**而不是自己造 Agent —— 自己造整个 Agent 就无法归因"是账本的功劳还是别的地方写得好"。
-
-### 14.2 测量协议
-
-- **任务流**：isolated（任务独立）与 **sequential**（顺序流）两种
-- **指标**：gain（增益）、**forgetting / backward transfer**（保留与遗忘）
-- 参考：Continual Learning Bench (2606.05661) 的显式 gain metric；AgentStream 的 isolated / sequential / interleaved 三模式
-
-### 14.3 定向恢复实验（本项目独有）
-
-1. 记录版本 A（会能力 X），继续进化到版本 B（丢了 X，但获得 Y、Z）
-2. 从 A 摘出引入 X 的改动，apply 到 B 上
-3. 验证：X 是否恢复，且 Y、Z 是否未被破坏
-
-**这是 DGM 做不到的操作，也是本项目最直接的差异化验证。**
-
-### 14.4 域的选择
-
-**必须选可执行验证的域**（代码 / 工具调用），不要选开放域。两个理由：
-
-1. 棘轮式的能力检测只在"回归可自动验证"的域里便宜
-2. 沙箱内的域没有"外部世界副作用不可回滚"的问题（第 9.2 节）
-
-## 15. 真实风险
-
-| 风险 | 说明 | 对策 |
+| 工作类别 | 已有能力 | Ouroboros 要补的部分 |
 | --- | --- | --- |
-| **奖励黑客** | 硬编码答案、改测试、探测评测环境 | 评测集只读挂载；接受前用全新任务复测；静态扫描可疑模式；前期人工过目每个 diff |
-| **误判可逆性** | 把"遗忘"当"权衡"，导致"切回来"的承诺落空 | 能力表必须实测，不能靠推测 |
-| **外部副作用** | 真实环境动作不可回滚 | 只在沙箱内评测；真实环境操作单独隔离 |
-| **过拟合** | 分数涨在训练集上 | held-out 物理隔离、永不进环；周期性换新题 |
-| **自欺出题** | 自己出题自己判 | 出题 / 判定分离 |
-| **能力定义困难** | "一项能力"怎么切分是主观的 | 前期用粗粒度，宁可少而准 |
-| **版本爆炸** | 每代存分支会积累几千个版本 | 每方向当前最佳 + 里程碑；纯文本基因组磁盘压力小 |
-| **成本** | 每代 N 次评测 x 任务数 | 主方向每次测，次要维度按需测 |
-| **收益递减** | 几代后停滞是常态 | 设代数 / 成本 / 边际收益三个停止条件 |
-| **上游变动** | 被测系统（DGM / pi）会 breaking change | 锁版本；只通过一层薄适配器接触它们 |
+| DGM 等代码自改进 | 生成代码 patch、保存版本谱系、在环境中运行候选 | 模型条件化方言、逐任务能力归因、能力债和定向恢复 |
+| ACE 等上下文进化 | 修改 playbook 或上下文内容 | 把上下文变化与工具协议、Runtime 代码放进同一个 Genome |
+| CI 回归门控 | 判断一组测试是否通过 | 多指标方向控制、能力粒度和跨代因果证据 |
+| 记忆系统 | 保存和检索长期内容 | 不只保存内容，还保存模型专属行为适配和版本来源 |
+| Open Interpreter / OpenHands | 提供完整工具或 coding agent Runtime | 作为可插拔对照对象，而不是固定母体 |
 
-## 16. 与已有工作的定位关系
+DGM、ACE 和门控系统的具体结论必须绑定仓库 URL、版本或 commit。这里的定位是“能力边界对照”，不是宣称这些系统完全没有相关功能。
 
-### 16.1 别人在做什么
+所有外部结论都应记录 URL、访问日期、仓库 commit 或模型版本，避免把动态星标和未锁定源码当成永久事实。
 
-- **论文线**（GEPA / ACE / DGM / SEAL）：会进化，但几乎不管记忆。扫过的 9 个仓库里 Letta / Mem0 / Zep / TencentDB-Agent-Memory 零命中
-- **记忆线**（AWM / ReasoningBank）：有记忆，但从不与进化线合流，而且也是自己造
-- **产品线**（MemOS / OpenViking / EverOS / Letta / TencentDB-Agent-Memory）：记忆是绝对主流，"自进化"和"记忆"几乎是同一个词
-- **门控线**（Tracely-ai / agent-qa）：给人类开发者的 CI 工具，守人工变更，不做进化循环内的选择压力
+## 16. 当前未决问题
 
-### 16.2 本项目的位置
+以下问题不阻塞 P0，但在进入对应阶段前必须解决：
 
-> **用户能自由控制进化方向，且代价可见、不可逆损失可恢复。**
-
-明确不碰：
-
-- 不做"又一个记忆层"（11k~47k stars 已占满）
-- 不做"又一个门控"（1400 stars 已占满）
-- 不做"又一个自进化框架"（几十个，最大的 47k stars）
-
-## 17. 附录：DGM 源码核实记录
-
-核实时间 2026-09-15，仓库 `jennyzzt/dgm`（2330 stars）。
-
-| 结论 | 证据 |
-| --- | --- |
-| `DGM_outer.py` 零 LLM 调用，纯编排 | 全文搜 `llm` 只命中一行报错字符串 |
-| 提方案用强推理模型、无工具 | `self_improve_step.py:28` `diagnose_model = 'o1-2024-12-17'`；L7 只 import `llm`（非 `llm_withtools`） |
-| 改代码用 Claude、带工具循环 | `coding_agent.py:9` import `llm_withtools`；L85 `self.code_model = CLAUDE_MODEL` |
-| **自改进循环在 LLM 层面完全无状态** | `self_improve_step.py` L49 / L102 `msg_history=None`；`coding_agent.py` L116 / L149 / L169 `chat_with_agent(..., msg_history=[], ...)` |
-| 接受准则不是棘轮，是地板 | `update_archive`：`if score >= get_original_score(output_dir) - noise_leeway`（初代分 - 0.1） |
-| 选父代只用聚合分数 | `choose_selfimproves`：用 `accuracy_score` 做 `1/(1+exp(-10*(score-0.5)))` 加权，或按 children_count 加权 |
-| per-instance 结果存了但不用于决策 | L113-115 取 `total_resolved_ids` / `total_unresolved_ids` / `total_emptypatch_ids`，但接受与选父代都只看 `accuracy_score` |
-| 有一个二值质量门 | `filter_compiled` —— 编译不过的会被过滤 |
-
-**最有价值的一条：整个自改进循环每次调用都从空历史开始。** 相当于 SGD 但批次为 1、没有动量、每步随机重新初始化。这正是本项目"方向控制器 + 账本"要补的位置。
-
-## 18. 待定问题
-
-1. **"一项能力"怎么定义？** 整个设计唯一真正难的地方。前期建议用粗粒度、人工可读的标签
-2. **provider 与预算？** 决定能跑多少代、每代几个重复样本（统计显著性需要重复）。当前 API key 未配置，是最大阻塞
-3. **被测系统选哪个？** DGM（代码层）还是 ACE（上下文层）作为第一个被测对象
-4. **第一批方向选哪几个？** 建议准确率 + token 起步
+1. 能力标签的最终粒度和任务覆盖率；
+2. 失败分类器的人工复核比例；
+3. 适应周期的最小实用效应；
+4. DeepSeek、GPT、Claude 的成本归一化方式；
+5. Agent Runtime 代码 patch 的依赖和兼容性模型；
+6. Runtime Profile 和 Contract 的兼容性判定阈值；
+7. 控制器版本变化是否需要重放历史适应周期；
+8. 版本 artifact 的长期存储和 GC 策略。
